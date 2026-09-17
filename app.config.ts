@@ -87,6 +87,13 @@ const config: ExpoConfig = {
   plugins: [
     "expo-router",
     [
+      "expo-media-library",
+      {
+        photosPermission: "Allow StegaHide to access your photos.",
+        savePhotosPermission: "Allow StegaHide to save hidden images to your photos.",
+      },
+    ],
+    [
       "expo-audio",
       {
         microphonePermission: "Allow $(PRODUCT_NAME) to access your microphone.",
