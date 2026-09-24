@@ -1,9 +1,24 @@
 const MAGIC = new Uint8Array([83, 84, 69, 71, 65, 72, 73, 68, 69, 0]);
 const VERSION = 1;
+const BYTES_PER_PIXEL_BUDGET = 0.5;
 
 export type ExtractedPayload = {
   base64: string;
   mimeType: string;
+};
+
+export type CapacityCheck = {
+  carrierWidth: number;
+  carrierHeight: number;
+  payloadWidth: number;
+  payloadHeight: number;
+  carrierPixels: number;
+  maxPayloadBytes: number;
+  payloadBytes: number;
+  remainingBytes: number;
+  payloadFits: boolean;
+  dimensionsFit: boolean;
+  fits: boolean;
 };
 
 function concatBytes(...parts: Uint8Array[]) {
@@ -59,6 +74,58 @@ function textToBytes(value: string) {
 
 function bytesToText(value: Uint8Array) {
   return new TextDecoder().decode(value);
+}
+
+export function getPayloadOverhead(payloadMimeType = "image/png") {
+  return MAGIC.length + 2 + textToBytes(payloadMimeType).length + 4;
+}
+
+export function getBase64ByteLength(base64: string) {
+  return base64ToBytes(base64).length;
+}
+
+export function calculateMaxPayloadBytes(carrierWidth: number, carrierHeight: number) {
+  if (!Number.isFinite(carrierWidth) || !Number.isFinite(carrierHeight) || carrierWidth <= 0 || carrierHeight <= 0) {
+    return 0;
+  }
+  return Math.floor(carrierWidth * carrierHeight * BYTES_PER_PIXEL_BUDGET);
+}
+
+export function validatePayloadCapacity({
+  carrierWidth,
+  carrierHeight,
+  payloadWidth,
+  payloadHeight,
+  payloadBase64,
+  payloadMimeType = "image/png",
+}: {
+  carrierWidth: number;
+  carrierHeight: number;
+  payloadWidth: number;
+  payloadHeight: number;
+  payloadBase64: string;
+  payloadMimeType?: string;
+}): CapacityCheck {
+  const carrierPixels = Math.max(0, Math.floor(carrierWidth * carrierHeight));
+  const maxPayloadBytes = calculateMaxPayloadBytes(carrierWidth, carrierHeight);
+  const payloadBytes = getBase64ByteLength(payloadBase64) + getPayloadOverhead(payloadMimeType);
+  const remainingBytes = maxPayloadBytes - payloadBytes;
+  const payloadFits = payloadBytes <= maxPayloadBytes;
+  const dimensionsFit = payloadWidth <= carrierWidth && payloadHeight <= carrierHeight;
+
+  return {
+    carrierWidth,
+    carrierHeight,
+    payloadWidth,
+    payloadHeight,
+    carrierPixels,
+    maxPayloadBytes,
+    payloadBytes,
+    remainingBytes,
+    payloadFits,
+    dimensionsFit,
+    fits: payloadFits && dimensionsFit,
+  };
 }
 
 export function embedImage(carrierBase64: string, payloadBase64: string, payloadMimeType = "image/png") {

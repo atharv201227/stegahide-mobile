@@ -1,6 +1,12 @@
 import * as FileSystem from "expo-file-system/legacy";
 
-export { embedImage, extractImage, type ExtractedPayload } from "./steganography-core";
+export {
+  embedImage,
+  extractImage,
+  validatePayloadCapacity,
+  type CapacityCheck,
+  type ExtractedPayload,
+} from "./steganography-core";
 
 export async function readImageBase64(uri: string) {
   return FileSystem.readAsStringAsync(uri, {

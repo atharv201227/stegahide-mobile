@@ -22,6 +22,7 @@ import {
   embedImage,
   extractImage,
   readImageBase64,
+  validatePayloadCapacity,
   writeImageBase64,
 } from "@/lib/steganography";
 
@@ -40,6 +41,13 @@ const COLORS = {
 
 type Mode = "hide" | "reveal";
 type PickTarget = "carrier" | "secret";
+type CapacityNotice = { text: string; ok: boolean };
+
+function formatBytes(bytes: number) {
+  if (bytes < 1024) return `${Math.max(0, Math.round(bytes))} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+}
 
 type ImageSlotProps = {
   label: string;
@@ -114,6 +122,7 @@ export default function HomeScreen() {
   const [resultUri, setResultUri] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+  const [capacityNotice, setCapacityNotice] = useState<CapacityNotice | null>(null);
 
   const ready = mode === "hide" ? Boolean(carrierUri && secretUri) : Boolean(carrierUri);
   const actionLabel = useMemo(() => (mode === "hide" ? "Create hidden image" : "Reveal hidden image"), [mode]);
@@ -123,6 +132,7 @@ export default function HomeScreen() {
     setMode(nextMode);
     setResultUri(null);
     setMessage(null);
+    setCapacityNotice(null);
   };
 
   const pickImage = async (target: PickTarget) => {
@@ -144,6 +154,7 @@ export default function HomeScreen() {
       setResultUri(null);
     }
     setMessage(null);
+    setCapacityNotice(null);
   };
 
   const processImages = async () => {
@@ -164,6 +175,22 @@ export default function HomeScreen() {
           { compress: 1, format: ImageManipulator.SaveFormat.PNG, base64: true },
         );
         if (!normalizedSecret.base64) throw new Error("Could not read the secret image");
+        const capacity = validatePayloadCapacity({
+          carrierWidth: normalized.width,
+          carrierHeight: normalized.height,
+          payloadWidth: normalizedSecret.width,
+          payloadHeight: normalizedSecret.height,
+          payloadBase64: normalizedSecret.base64,
+          payloadMimeType: "image/png",
+        });
+        if (!capacity.fits) {
+          const reason = !capacity.dimensionsFit
+            ? `Secret image is ${normalizedSecret.width}×${normalizedSecret.height}px, but the carrier is ${normalized.width}×${normalized.height}px.`
+            : `Secret image needs ${formatBytes(capacity.payloadBytes)}, but this carrier safely supports ${formatBytes(capacity.maxPayloadBytes)}.`;
+          setCapacityNotice({ text: `Capacity check failed · ${reason}`, ok: false });
+          throw new Error("The secret image is too large for this carrier. Choose a larger carrier or a smaller secret image.");
+        }
+        setCapacityNotice({ text: `Capacity check passed · ${formatBytes(capacity.remainingBytes)} remaining`, ok: true });
         const encoded = embedImage(normalized.base64, normalizedSecret.base64, "image/png");
         const uri = await writeImageBase64(
           encoded,
@@ -222,6 +249,7 @@ export default function HomeScreen() {
     setSecretName(null);
     setResultUri(null);
     setMessage(null);
+    setCapacityNotice(null);
   };
 
   return (
@@ -282,8 +310,15 @@ export default function HomeScreen() {
 
         <View style={styles.tipRow}>
           <MaterialIcons name="info-outline" size={17} color={COLORS.cyan} />
-          <Text style={styles.tipText}>For best results, use a high-resolution PNG as the carrier.</Text>
+          <Text style={styles.tipText}>Capacity uses a conservative pixel budget so hidden images fit reliably.</Text>
         </View>
+
+        {capacityNotice && (
+          <View style={[styles.capacityNotice, capacityNotice.ok ? styles.capacitySuccess : styles.capacityError]}>
+            <MaterialIcons name={capacityNotice.ok ? "check-circle" : "warning-amber"} size={17} color={capacityNotice.ok ? COLORS.green : COLORS.danger} />
+            <Text style={styles.capacityText}>{capacityNotice.text}</Text>
+          </View>
+        )}
 
         <Pressable
           onPress={processImages}
@@ -373,6 +408,10 @@ const styles = StyleSheet.create({
   connectorBadge: { width: 22, height: 22, borderRadius: 11, backgroundColor: COLORS.background, borderWidth: 1, borderColor: COLORS.border, alignItems: "center", justifyContent: "center" },
   tipRow: { flexDirection: "row", alignItems: "center", gap: 7, paddingHorizontal: 3, marginTop: 12, marginBottom: 15 },
   tipText: { flex: 1, color: COLORS.muted, fontSize: 11, lineHeight: 16 },
+  capacityNotice: { flexDirection: "row", alignItems: "flex-start", gap: 8, borderRadius: 13, padding: 12, marginTop: -3, marginBottom: 13, borderWidth: 1 },
+  capacitySuccess: { backgroundColor: `${COLORS.green}10`, borderColor: `${COLORS.green}35` },
+  capacityError: { backgroundColor: `${COLORS.danger}10`, borderColor: `${COLORS.danger}35` },
+  capacityText: { flex: 1, color: COLORS.muted, fontSize: 11, lineHeight: 16 },
   primaryButton: { minHeight: 56, borderRadius: 16, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 9, backgroundColor: COLORS.orange },
   primaryButtonDisabled: { opacity: 0.42 },
   primaryButtonText: { color: COLORS.background, fontSize: 14, fontWeight: "900", letterSpacing: -0.1 },

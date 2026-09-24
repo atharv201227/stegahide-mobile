@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import { embedImage, extractImage } from "../lib/steganography-core";
+import {
+  calculateMaxPayloadBytes,
+  embedImage,
+  extractImage,
+  validatePayloadCapacity,
+} from "../lib/steganography-core";
 
 describe("steganography payload", () => {
   it("round trips a hidden image payload without changing carrier bytes", () => {
@@ -16,5 +21,37 @@ describe("steganography payload", () => {
 
   it("rejects images without a valid StegaHide footer", () => {
     expect(() => extractImage(btoa("ordinary-image"))).toThrow(/payload/i);
+  });
+
+  it("calculates a conservative carrier payload budget", () => {
+    expect(calculateMaxPayloadBytes(100, 80)).toBe(4000);
+  });
+
+  it("rejects a payload that exceeds carrier bytes or dimensions", () => {
+    const payload = btoa("x".repeat(80));
+    const result = validatePayloadCapacity({
+      carrierWidth: 10,
+      carrierHeight: 10,
+      payloadWidth: 12,
+      payloadHeight: 8,
+      payloadBase64: payload,
+    });
+
+    expect(result.payloadFits).toBe(false);
+    expect(result.dimensionsFit).toBe(false);
+    expect(result.fits).toBe(false);
+  });
+
+  it("accepts a payload that fits both checks", () => {
+    const result = validatePayloadCapacity({
+      carrierWidth: 100,
+      carrierHeight: 100,
+      payloadWidth: 80,
+      payloadHeight: 70,
+      payloadBase64: btoa("small-secret"),
+    });
+
+    expect(result.fits).toBe(true);
+    expect(result.remainingBytes).toBeGreaterThan(0);
   });
 });
