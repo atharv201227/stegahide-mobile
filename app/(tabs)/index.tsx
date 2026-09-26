@@ -3,7 +3,7 @@ import * as ImageManipulator from "expo-image-manipulator";
 import * as ImagePicker from "expo-image-picker";
 import * as MediaLibrary from "expo-media-library";
 import * as Sharing from "expo-sharing";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -13,13 +13,17 @@ import {
   ScrollView,
   StyleSheet,
   Text,
+  TextInput,
   View,
 } from "react-native";
 import MaterialIcons from "@expo/vector-icons/MaterialIcons";
 
 import { ScreenContainer } from "@/components/screen-container";
 import {
+  decryptPayload,
   embedImage,
+  encryptPayload,
+  ENCRYPTED_MIME_TYPE,
   extractImage,
   readImageBase64,
   validatePayloadCapacity,
@@ -42,11 +46,16 @@ const COLORS = {
 type Mode = "hide" | "reveal";
 type PickTarget = "carrier" | "secret";
 type CapacityNotice = { text: string; ok: boolean };
+type CapacityState = ReturnType<typeof validatePayloadCapacity> | null;
 
 function formatBytes(bytes: number) {
   if (bytes < 1024) return `${Math.max(0, Math.round(bytes))} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+function fitScale(width: number, height: number, scale: number) {
+  return { width: Math.max(1, Math.floor(width * scale)), height: Math.max(1, Math.floor(height * scale)) };
 }
 
 type ImageSlotProps = {
@@ -123,9 +132,45 @@ export default function HomeScreen() {
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [capacityNotice, setCapacityNotice] = useState<CapacityNotice | null>(null);
+  const [password, setPassword] = useState("");
+  const [capacity, setCapacity] = useState<CapacityState>(null);
+  const [capacityBusy, setCapacityBusy] = useState(false);
 
-  const ready = mode === "hide" ? Boolean(carrierUri && secretUri) : Boolean(carrierUri);
+  const ready = mode === "hide" ? Boolean(carrierUri && secretUri && password.trim().length >= 4) : Boolean(carrierUri && password.trim().length >= 4);
   const actionLabel = useMemo(() => (mode === "hide" ? "Create hidden image" : "Reveal hidden image"), [mode]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const previewCapacity = async () => {
+      if (mode !== "hide" || !carrierUri || !secretUri) {
+        setCapacity(null);
+        return;
+      }
+      setCapacityBusy(true);
+      try {
+        const [carrier, secret] = await Promise.all([
+          ImageManipulator.manipulateAsync(carrierUri, [], { compress: 1, format: ImageManipulator.SaveFormat.PNG, base64: true }),
+          ImageManipulator.manipulateAsync(secretUri, [], { compress: 0.82, format: ImageManipulator.SaveFormat.JPEG, base64: true }),
+        ]);
+        if (!carrier.base64 || !secret.base64 || cancelled) return;
+        const encrypted = encryptPayload(secret.base64, "image/jpeg", password.trim().length >= 4 ? password : "preview-password");
+        setCapacity(validatePayloadCapacity({
+          carrierWidth: carrier.width,
+          carrierHeight: carrier.height,
+          payloadWidth: secret.width,
+          payloadHeight: secret.height,
+          payloadBase64: encrypted,
+          payloadMimeType: ENCRYPTED_MIME_TYPE,
+        }));
+      } catch {
+        if (!cancelled) setCapacity(null);
+      } finally {
+        if (!cancelled) setCapacityBusy(false);
+      }
+    };
+    void previewCapacity();
+    return () => { cancelled = true; };
+  }, [carrierUri, mode, password, secretUri]);
 
   const changeMode = (nextMode: Mode) => {
     void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
@@ -163,46 +208,67 @@ export default function HomeScreen() {
     setMessage(null);
     try {
       if (mode === "hide" && secretUri) {
+        if (password.trim().length < 4) throw new Error("Choose a password with at least 4 characters");
         const normalized = await ImageManipulator.manipulateAsync(
           carrierUri,
           [],
           { compress: 1, format: ImageManipulator.SaveFormat.PNG, base64: true },
         );
         if (!normalized.base64) throw new Error("Could not read the carrier image");
-        const normalizedSecret = await ImageManipulator.manipulateAsync(
+        const sourceSecret = await ImageManipulator.manipulateAsync(
           secretUri,
           [],
-          { compress: 1, format: ImageManipulator.SaveFormat.PNG, base64: true },
+          { compress: 0.86, format: ImageManipulator.SaveFormat.JPEG, base64: false },
         );
-        if (!normalizedSecret.base64) throw new Error("Could not read the secret image");
-        const capacity = validatePayloadCapacity({
-          carrierWidth: normalized.width,
-          carrierHeight: normalized.height,
-          payloadWidth: normalizedSecret.width,
-          payloadHeight: normalizedSecret.height,
-          payloadBase64: normalizedSecret.base64,
-          payloadMimeType: "image/png",
-        });
-        if (!capacity.fits) {
-          const reason = !capacity.dimensionsFit
-            ? `Secret image is ${normalizedSecret.width}×${normalizedSecret.height}px, but the carrier is ${normalized.width}×${normalized.height}px.`
-            : `Secret image needs ${formatBytes(capacity.payloadBytes)}, but this carrier safely supports ${formatBytes(capacity.maxPayloadBytes)}.`;
-          setCapacityNotice({ text: `Capacity check failed · ${reason}`, ok: false });
-          throw new Error("The secret image is too large for this carrier. Choose a larger carrier or a smaller secret image.");
+        let fittingSecret: Awaited<ReturnType<typeof ImageManipulator.manipulateAsync>> | null = null;
+        let fittingEncrypted = "";
+        let fittingCapacity: CapacityState = null;
+        const qualities = [0.86, 0.74, 0.62, 0.5];
+        for (let step = 0; step < 8 && !fittingSecret; step += 1) {
+          const scale = Math.pow(0.82, Math.floor(step / qualities.length));
+          const quality = qualities[step % qualities.length];
+          const resize = fitScale(sourceSecret.width, sourceSecret.height, scale);
+          const candidate = await ImageManipulator.manipulateAsync(
+            secretUri,
+            [{ resize }],
+            { compress: quality, format: ImageManipulator.SaveFormat.JPEG, base64: true },
+          );
+          if (!candidate.base64) continue;
+          const encrypted = encryptPayload(candidate.base64, "image/jpeg", password);
+          const candidateCapacity = validatePayloadCapacity({
+            carrierWidth: normalized.width,
+            carrierHeight: normalized.height,
+            payloadWidth: candidate.width,
+            payloadHeight: candidate.height,
+            payloadBase64: encrypted,
+            payloadMimeType: ENCRYPTED_MIME_TYPE,
+          });
+          if (candidateCapacity.fits) {
+            fittingSecret = candidate;
+            fittingEncrypted = encrypted;
+            fittingCapacity = candidateCapacity;
+          }
         }
-        setCapacityNotice({ text: `Capacity check passed · ${formatBytes(capacity.remainingBytes)} remaining`, ok: true });
-        const encoded = embedImage(normalized.base64, normalizedSecret.base64, "image/png");
-        const uri = await writeImageBase64(
-          encoded,
-          "image/png",
-        );
+        if (!fittingSecret || !fittingCapacity) {
+          setCapacityNotice({ text: "Capacity check failed · even the smallest automatic fit is too large for this carrier.", ok: false });
+          throw new Error("This carrier cannot hold the secret image. Choose a larger carrier.");
+        }
+        setCapacity(fittingCapacity);
+        const resized = fittingSecret.width !== normalized.width || fittingSecret.height !== normalized.height;
+        setCapacityNotice({ text: `${resized ? "Secret image auto-fitted · " : "Capacity check passed · "}${formatBytes(fittingCapacity.remainingBytes)} remaining`, ok: true });
+        const encoded = embedImage(normalized.base64, fittingEncrypted, ENCRYPTED_MIME_TYPE);
+        const uri = await writeImageBase64(encoded, "image/png");
         setResultUri(uri);
-        setMessage("Your carrier image now contains the secret image.");
+        setMessage("Your carrier image now contains an encrypted secret image.");
         void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
       } else {
+        if (password.trim().length < 4) throw new Error("Enter the password used to hide this image");
         const carrierBase64 = await readImageBase64(carrierUri);
         const extracted = extractImage(carrierBase64);
-        const uri = await writeImageBase64(extracted.base64, extracted.mimeType);
+        const decrypted = extracted.mimeType === ENCRYPTED_MIME_TYPE
+          ? decryptPayload(extracted.base64, password)
+          : extracted;
+        const uri = await writeImageBase64(decrypted.base64, decrypted.mimeType);
         setResultUri(uri);
         setMessage("Hidden image revealed successfully.");
         void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
@@ -250,6 +316,8 @@ export default function HomeScreen() {
     setResultUri(null);
     setMessage(null);
     setCapacityNotice(null);
+    setCapacity(null);
+    setPassword("");
   };
 
   return (
@@ -307,6 +375,41 @@ export default function HomeScreen() {
           {mode === "hide" && <View style={styles.connector}><View style={styles.connectorLine} /><View style={styles.connectorBadge}><MaterialIcons name="add" size={14} color={COLORS.muted} /></View><View style={styles.connectorLine} /></View>}
           {mode === "hide" && <ImageSlot label="Secret image" hint="The image to hide" icon="image-search" uri={secretUri} fileName={secretName} accent={COLORS.cyan} onPress={() => pickImage("secret")} />}
         </View>
+
+        <View style={styles.passwordCard}>
+          <View style={styles.passwordIcon}><MaterialIcons name="lock-outline" size={19} color={COLORS.orange} /></View>
+          <View style={styles.passwordCopy}>
+            <Text style={styles.passwordLabel}>{mode === "hide" ? "Encryption password" : "Decryption password"}</Text>
+            <TextInput
+              value={password}
+              onChangeText={(value) => { setPassword(value); setCapacityNotice(null); }}
+              placeholder={mode === "hide" ? "At least 4 characters" : "Enter your password"}
+              placeholderTextColor={COLORS.muted}
+              secureTextEntry
+              autoCapitalize="none"
+              autoCorrect={false}
+              style={styles.passwordInput}
+            />
+          </View>
+          <MaterialIcons name={password.length >= 4 ? "check-circle" : "vpn-key"} size={18} color={password.length >= 4 ? COLORS.green : COLORS.muted} />
+        </View>
+
+        {mode === "hide" && carrierUri && secretUri && (
+          <View style={styles.meterCard}>
+            <View style={styles.meterHeader}>
+              <View>
+                <Text style={styles.meterTitle}>Live capacity</Text>
+                <Text style={styles.meterSubtitle}>{capacityBusy ? "Estimating encrypted payload…" : capacity ? `${formatBytes(capacity.payloadBytes)} of ${formatBytes(capacity.maxPayloadBytes)} budget` : "Enter a password to estimate size"}</Text>
+              </View>
+              <Text style={[styles.meterPercent, capacity && !capacity.fits && { color: COLORS.danger }]}>{capacity ? `${Math.min(999, Math.round((capacity.payloadBytes / Math.max(1, capacity.maxPayloadBytes)) * 100))}%` : "—"}</Text>
+            </View>
+            <View style={styles.meterTrack}><View style={[styles.meterFill, { width: `${Math.min(100, capacity ? (capacity.payloadBytes / Math.max(1, capacity.maxPayloadBytes)) * 100 : 0)}%` }, capacity && !capacity.fits && styles.meterFillDanger]} /></View>
+            <View style={styles.meterFooter}>
+              <Text style={styles.meterFooterText}>{capacity?.fits ? "Fits safely" : capacity ? "Auto-fit will resize/compress the secret" : "Encrypted after you add a password"}</Text>
+              {capacity && <MaterialIcons name={capacity.fits ? "check" : "auto-fix-high"} size={14} color={capacity.fits ? COLORS.green : COLORS.orange} />}
+            </View>
+          </View>
+        )}
 
         <View style={styles.tipRow}>
           <MaterialIcons name="info-outline" size={17} color={COLORS.cyan} />
@@ -406,6 +509,21 @@ const styles = StyleSheet.create({
   connector: { height: 27, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 8 },
   connectorLine: { width: 58, height: 1, backgroundColor: COLORS.border },
   connectorBadge: { width: 22, height: 22, borderRadius: 11, backgroundColor: COLORS.background, borderWidth: 1, borderColor: COLORS.border, alignItems: "center", justifyContent: "center" },
+  passwordCard: { flexDirection: "row", alignItems: "center", gap: 10, marginTop: 12, padding: 12, borderRadius: 15, borderWidth: 1, borderColor: COLORS.border, backgroundColor: `${COLORS.surface}CC` },
+  passwordIcon: { width: 34, height: 34, borderRadius: 10, alignItems: "center", justifyContent: "center", backgroundColor: `${COLORS.orange}18` },
+  passwordCopy: { flex: 1 },
+  passwordLabel: { color: COLORS.text, fontSize: 12, fontWeight: "800", marginBottom: 3 },
+  passwordInput: { color: COLORS.text, fontSize: 12, padding: 0, minHeight: 22 },
+  meterCard: { marginTop: 11, padding: 13, borderRadius: 15, borderWidth: 1, borderColor: `${COLORS.cyan}35`, backgroundColor: `${COLORS.cyan}0A` },
+  meterHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
+  meterTitle: { color: COLORS.text, fontSize: 12, fontWeight: "800" },
+  meterSubtitle: { color: COLORS.muted, fontSize: 10, marginTop: 4 },
+  meterPercent: { color: COLORS.cyan, fontSize: 18, fontWeight: "900" },
+  meterTrack: { height: 7, borderRadius: 4, backgroundColor: COLORS.border, overflow: "hidden", marginTop: 12 },
+  meterFill: { height: "100%", borderRadius: 4, backgroundColor: COLORS.cyan },
+  meterFillDanger: { backgroundColor: COLORS.danger },
+  meterFooter: { flexDirection: "row", alignItems: "center", gap: 5, marginTop: 8 },
+  meterFooterText: { color: COLORS.muted, fontSize: 10, flex: 1 },
   tipRow: { flexDirection: "row", alignItems: "center", gap: 7, paddingHorizontal: 3, marginTop: 12, marginBottom: 15 },
   tipText: { flex: 1, color: COLORS.muted, fontSize: 11, lineHeight: 16 },
   capacityNotice: { flexDirection: "row", alignItems: "flex-start", gap: 8, borderRadius: 13, padding: 12, marginTop: -3, marginBottom: 13, borderWidth: 1 },

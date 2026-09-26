@@ -1,8 +1,16 @@
+import CryptoJS from "crypto-js";
+
 const MAGIC = new Uint8Array([83, 84, 69, 71, 65, 72, 73, 68, 69, 0]);
 const VERSION = 1;
 const BYTES_PER_PIXEL_BUDGET = 0.5;
+export const ENCRYPTED_MIME_TYPE = "application/x-stegahide-encrypted";
 
 export type ExtractedPayload = {
+  base64: string;
+  mimeType: string;
+};
+
+export type DecryptedPayload = {
   base64: string;
   mimeType: string;
 };
@@ -53,9 +61,7 @@ function bytesToNumber(bytes: Uint8Array, offset: number) {
 function base64ToBytes(base64: string) {
   const binary = globalThis.atob(base64);
   const output = new Uint8Array(binary.length);
-  for (let index = 0; index < binary.length; index += 1) {
-    output[index] = binary.charCodeAt(index);
-  }
+  for (let index = 0; index < binary.length; index += 1) output[index] = binary.charCodeAt(index);
   return output;
 }
 
@@ -85,9 +91,7 @@ export function getBase64ByteLength(base64: string) {
 }
 
 export function calculateMaxPayloadBytes(carrierWidth: number, carrierHeight: number) {
-  if (!Number.isFinite(carrierWidth) || !Number.isFinite(carrierHeight) || carrierWidth <= 0 || carrierHeight <= 0) {
-    return 0;
-  }
+  if (!Number.isFinite(carrierWidth) || !Number.isFinite(carrierHeight) || carrierWidth <= 0 || carrierHeight <= 0) return 0;
   return Math.floor(carrierWidth * carrierHeight * BYTES_PER_PIXEL_BUDGET);
 }
 
@@ -112,20 +116,29 @@ export function validatePayloadCapacity({
   const remainingBytes = maxPayloadBytes - payloadBytes;
   const payloadFits = payloadBytes <= maxPayloadBytes;
   const dimensionsFit = payloadWidth <= carrierWidth && payloadHeight <= carrierHeight;
+  return { carrierWidth, carrierHeight, payloadWidth, payloadHeight, carrierPixels, maxPayloadBytes, payloadBytes, remainingBytes, payloadFits, dimensionsFit, fits: payloadFits && dimensionsFit };
+}
 
-  return {
-    carrierWidth,
-    carrierHeight,
-    payloadWidth,
-    payloadHeight,
-    carrierPixels,
-    maxPayloadBytes,
-    payloadBytes,
-    remainingBytes,
-    payloadFits,
-    dimensionsFit,
-    fits: payloadFits && dimensionsFit,
-  };
+export function encryptPayload(base64: string, mimeType: string, password: string) {
+  if (password.trim().length < 4) throw new Error("Password must be at least 4 characters");
+  const checksum = CryptoJS.HmacSHA256(`${mimeType}:${base64}`, password).toString();
+  const envelope = JSON.stringify({ version: 1, mimeType, base64, checksum });
+  return CryptoJS.AES.encrypt(envelope, password).toString();
+}
+
+export function decryptPayload(encryptedBase64: string, password: string): DecryptedPayload {
+  if (password.trim().length < 4) throw new Error("Enter the password used to hide this image");
+  try {
+    const decrypted = CryptoJS.AES.decrypt(encryptedBase64, password).toString(CryptoJS.enc.Utf8);
+    if (!decrypted) throw new Error("Incorrect password");
+    const envelope = JSON.parse(decrypted) as { version?: number; mimeType?: string; base64?: string; checksum?: string };
+    if (envelope.version !== 1 || !envelope.mimeType || !envelope.base64 || !envelope.checksum) throw new Error("Invalid encrypted payload");
+    const expectedChecksum = CryptoJS.HmacSHA256(`${envelope.mimeType}:${envelope.base64}`, password).toString();
+    if (expectedChecksum !== envelope.checksum) throw new Error("Invalid password");
+    return { mimeType: envelope.mimeType, base64: envelope.base64 };
+  } catch {
+    throw new Error("Incorrect password or damaged hidden image");
+  }
 }
 
 export function embedImage(carrierBase64: string, payloadBase64: string, payloadMimeType = "image/png") {
@@ -133,14 +146,7 @@ export function embedImage(carrierBase64: string, payloadBase64: string, payload
   const payload = base64ToBytes(payloadBase64);
   const mime = textToBytes(payloadMimeType);
   if (mime.length > 255) throw new Error("Unsupported payload type");
-
-  const header = concatBytes(
-    MAGIC,
-    new Uint8Array([VERSION, mime.length]),
-    mime,
-    numberToBytes(payload.length),
-    payload,
-  );
+  const header = concatBytes(MAGIC, new Uint8Array([VERSION, mime.length]), mime, numberToBytes(payload.length), payload);
   return bytesToBase64(concatBytes(carrier, header));
 }
 
@@ -148,17 +154,12 @@ export function extractImage(carrierBase64: string): ExtractedPayload {
   const bytes = base64ToBytes(carrierBase64);
   const minimumLength = MAGIC.length + 2 + 4;
   if (bytes.length < minimumLength) throw new Error("No StegaHide payload found");
-
   for (let index = bytes.length - minimumLength; index >= 0; index -= 1) {
     let matches = true;
     for (let magicIndex = 0; magicIndex < MAGIC.length; magicIndex += 1) {
-      if (bytes[index + magicIndex] !== MAGIC[magicIndex]) {
-        matches = false;
-        break;
-      }
+      if (bytes[index + magicIndex] !== MAGIC[magicIndex]) { matches = false; break; }
     }
     if (!matches || bytes[index + MAGIC.length] !== VERSION) continue;
-
     const mimeLength = bytes[index + MAGIC.length + 1];
     const mimeStart = index + MAGIC.length + 2;
     const lengthStart = mimeStart + mimeLength;
@@ -166,11 +167,8 @@ export function extractImage(carrierBase64: string): ExtractedPayload {
     const payloadLength = bytesToNumber(bytes, lengthStart);
     const payloadStart = lengthStart + 4;
     if (payloadStart + payloadLength !== bytes.length) continue;
-
     const mimeType = bytesToText(bytes.subarray(mimeStart, lengthStart)) || "image/png";
-    const payload = bytes.subarray(payloadStart, payloadStart + payloadLength);
-    return { base64: bytesToBase64(payload), mimeType };
+    return { base64: bytesToBase64(bytes.subarray(payloadStart, payloadStart + payloadLength)), mimeType };
   }
-
   throw new Error("No valid StegaHide payload found in this image");
 }

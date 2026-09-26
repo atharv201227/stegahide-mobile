@@ -1,8 +1,11 @@
 import * as FileSystem from "expo-file-system/legacy";
 
 export {
+  decryptPayload,
   embedImage,
+  encryptPayload,
   extractImage,
+  ENCRYPTED_MIME_TYPE,
   validatePayloadCapacity,
   type CapacityCheck,
   type ExtractedPayload,

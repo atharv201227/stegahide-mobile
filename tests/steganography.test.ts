@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 
 import {
   calculateMaxPayloadBytes,
+  decryptPayload,
   embedImage,
+  encryptPayload,
   extractImage,
   validatePayloadCapacity,
 } from "../lib/steganography-core";
@@ -53,5 +55,16 @@ describe("steganography payload", () => {
 
     expect(result.fits).toBe(true);
     expect(result.remainingBytes).toBeGreaterThan(0);
+  });
+
+  it("encrypts and decrypts a secret payload with a password", () => {
+    const encrypted = encryptPayload(btoa("secret-image"), "image/jpeg", "correct horse");
+    expect(encrypted).not.toContain("secret-image");
+    expect(decryptPayload(encrypted, "correct horse")).toEqual({ base64: btoa("secret-image"), mimeType: "image/jpeg" });
+  });
+
+  it("rejects an incorrect password", () => {
+    const encrypted = encryptPayload(btoa("secret-image"), "image/jpeg", "correct horse");
+    expect(() => decryptPayload(encrypted, "wrong password")).toThrow(/password/i);
   });
 });
